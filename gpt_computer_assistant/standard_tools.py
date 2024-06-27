@@ -2,7 +2,6 @@ from bs4 import BeautifulSoup
 import requests
 import re
 from urllib.parse import urljoin
-from urllib.parse import urljoin
 
 from .tooler import tool
 from .top_bar_wrapper import wrapper
