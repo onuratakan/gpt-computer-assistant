@@ -7,12 +7,13 @@ on:
       - completed
 
 permissions:
-  contents: write      
+  contents: read
+  pull-requests: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_run' }}
     environment: Release
     steps:
     - uses: actions/checkout@v3
@@ -20,9 +21,15 @@ jobs:
         fetch-depth: 0
     - name: Getting Tag
       id: tag_extractor
-      run: echo "latest_tag=$(git describe --tags --abbrev=0)" >> "$GITHUB_OUTPUT"
+      run: |
+        latest_tag=$(git describe --tags --abbrev=0)
+        if [ -z "$latest_tag" ]; then
+          echo "Error: No tags found."
+          exit 1
+        fi
+        echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
   
-    - uses: ncipollo/release-action@v1
+    - uses: ncipollo/release-action@v1 # Replace 'v1' with the specific commit SHA, e.g., 'abc1234'
       with:
         name: GPT Computer Assistant ${{ steps.tag_extractor.outputs.latest_tag }}
         generateReleaseNotes: true
