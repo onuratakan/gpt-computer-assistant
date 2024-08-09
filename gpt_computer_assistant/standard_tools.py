@@ -111,19 +111,23 @@ def copy(text: str):
 
 @register_tool
 @wrapper
-def open_url(url) -> bool:
+def open_url(url: str) -> bool:
     """
     Open the URL in the default web browser.
 
-    :param url: str:
+    :param url: The URL to open.
+    :type url: str
+    :return: True if the URL was opened successfully, False otherwise.
+    :rtype: bool
     """
-    import webbrowser
-
     try:
         webbrowser.open(url)
         return True
-    except:
+    except webbrowser.Error as e:
+        print(f"Failed to open URL {url}: {e}")
         return False
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
         return False
 
 @register_tool
