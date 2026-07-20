@@ -16,6 +16,7 @@ try:
     from pymongo import MongoClient, ReturnDocument, ReplaceOne
     from pymongo.collection import Collection
     from pymongo.database import Database
+    from pymongo.driver_info import DriverInfo
 
     PYMONGO_AVAILABLE = True
 except ImportError:
@@ -25,6 +26,7 @@ except ImportError:
     Database = None  # type: ignore
     ReturnDocument = None  # type: ignore
     ReplaceOne = None  # type: ignore
+    DriverInfo = None  # type: ignore
 
 from upsonic.storage.base import Storage
 from upsonic.storage.mongo.utils import (
@@ -39,6 +41,14 @@ from upsonic.utils.logging_config import get_logger
 
 
 _logger = get_logger("upsonic.storage.mongo")
+
+try:
+    from importlib.metadata import version as _get_version
+    _UPSONIC_VERSION: str | None = _get_version("upsonic")
+except Exception:
+    _UPSONIC_VERSION = None
+
+_DRIVER_INFO = DriverInfo(name="Upsonic", version=_UPSONIC_VERSION) if DriverInfo is not None else None
 
 
 class MongoStorage(Storage):
@@ -118,7 +128,7 @@ class MongoStorage(Storage):
         if db_client is not None:
             self._client: MongoClient = db_client
         else:
-            self._client = MongoClient(db_url)
+            self._client = MongoClient(db_url, driver=_DRIVER_INFO)
 
         # Database and collection caches
         self._database: Optional[Database] = None
