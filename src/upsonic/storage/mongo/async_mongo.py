@@ -28,6 +28,7 @@ try:
     from pymongo import AsyncMongoClient  # type: ignore
     from pymongo.collection import AsyncCollection  # type: ignore
     from pymongo.database import AsyncDatabase  # type: ignore
+    from pymongo.driver_info import DriverInfo as _DriverInfo
 
     PYMONGO_ASYNC_AVAILABLE = True
 except ImportError:
@@ -35,6 +36,7 @@ except ImportError:
     AsyncMongoClient = None  # type: ignore
     AsyncDatabase = None  # type: ignore
     AsyncCollection = None  # type: ignore
+    _DriverInfo = None  # type: ignore
 
 try:
     from pymongo import ReturnDocument, ReplaceOne
@@ -55,6 +57,14 @@ from upsonic.utils.logging_config import get_logger
 
 
 _logger = get_logger("upsonic.storage.mongo")
+
+try:
+    from importlib.metadata import version as _get_version
+    _UPSONIC_VERSION: str | None = _get_version("upsonic")
+except Exception:
+    _UPSONIC_VERSION = None
+
+_ASYNC_DRIVER_INFO = _DriverInfo(name="Upsonic", version=_UPSONIC_VERSION) if _DriverInfo is not None else None
 
 
 # Client type constants
@@ -269,7 +279,7 @@ class AsyncMongoStorage(AsyncStorage):
                         self._client_type == self.CLIENT_TYPE_PYMONGO_ASYNC
                         and PYMONGO_ASYNC_AVAILABLE
                     ):
-                        self._client = AsyncMongoClient(self.db_url)  # type: ignore
+                        self._client = AsyncMongoClient(self.db_url, driver=_ASYNC_DRIVER_INFO)  # type: ignore
                     elif self._client_type == self.CLIENT_TYPE_MOTOR and MOTOR_AVAILABLE:
                         self._client = AsyncIOMotorClient(self.db_url)  # type: ignore
                     else:
@@ -297,7 +307,7 @@ class AsyncMongoStorage(AsyncStorage):
                     self._client_type == self.CLIENT_TYPE_PYMONGO_ASYNC
                     and PYMONGO_ASYNC_AVAILABLE
                 ):
-                    self._client = AsyncMongoClient(self.db_url)  # type: ignore
+                    self._client = AsyncMongoClient(self.db_url, driver=_ASYNC_DRIVER_INFO)  # type: ignore
                 elif self._client_type == self.CLIENT_TYPE_MOTOR and MOTOR_AVAILABLE:
                     self._client = AsyncIOMotorClient(self.db_url)  # type: ignore
                 else:
