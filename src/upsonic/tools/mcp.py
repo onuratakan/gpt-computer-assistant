@@ -367,13 +367,17 @@ class MCPHandler:
             self.server_params = StreamableHTTPClientParams(url=url)
         elif self.connection_type == 'stdio' and command:
             parts = prepare_command(command)
-            inherited_env: Dict[str, str] = {**os.environ}
+            # Start from a minimal safe environment rather than the full
+            # ``os.environ`` so API keys, cloud credentials, and other secrets
+            # are not leaked to MCP server child processes (issue #621).
+            from mcp.client.stdio import get_default_environment
+            safe_env: Dict[str, str] = get_default_environment()
             if env is not None:
-                inherited_env.update(env)
+                safe_env.update(env)
             self.server_params = StdioServerParameters(
                 command=parts[0],
                 args=parts[1:] if len(parts) > 1 else [],
-                env=inherited_env
+                env=safe_env
             )
         else:
             raise ValueError("Invalid configuration for MCP handler")
