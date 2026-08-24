@@ -35,6 +35,7 @@ class ToolExecution:
     external_execution_required: Optional[bool] = None
 
     result_injected: bool = False
+    requires_guardrail_authorization: bool = False
 
     @property
     def is_paused(self) -> bool:
@@ -59,6 +60,8 @@ class ToolExecution:
             "user_input_schema": self.user_input_schema,
             "answered": self.answered,
             "external_execution_required": self.external_execution_required,
+            "result_injected": self.result_injected,
+            "requires_guardrail_authorization": self.requires_guardrail_authorization,
         }
 
     @classmethod
@@ -84,6 +87,8 @@ class ToolExecution:
             user_input_schema=data.get("user_input_schema"),
             answered=data.get("answered"),
             external_execution_required=data.get("external_execution_required"),
+            result_injected=data.get("result_injected", False),
+            requires_guardrail_authorization=data.get("requires_guardrail_authorization", False),
             metrics=metrics,
             created_at=data.get("created_at", int(time())),
         )

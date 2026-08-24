@@ -340,6 +340,7 @@ class ToolManager:
         tools: list,
         task: Optional['Task'] = None,
         agent_instance: Optional[Any] = None,
+        live_agent_instance: Optional[Any] = None,
     ) -> Dict[str, 'Tool']:
         """Register tools, wrap them, and update the orchestrator state."""
         if not tools:
@@ -351,7 +352,12 @@ class ToolManager:
         for name, tool_obj in new_tools.items():
             self.registry.store_wrapped(name, self.wrapper.wrap(tool_obj))
 
-        self.orchestrator_lifecycle.maybe_create(new_tools, task, agent_instance)
+        self.orchestrator_lifecycle.maybe_create(
+            new_tools,
+            task,
+            agent_instance,
+            live_agent_instance,
+        )
         if task is not None:
             self.orchestrator_lifecycle.update_context(task)
 

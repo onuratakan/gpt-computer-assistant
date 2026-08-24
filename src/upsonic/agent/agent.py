@@ -11,6 +11,38 @@ from upsonic.utils.logging_config import sentry_sdk, get_env_bool_optional, get_
 _pl_logger = get_logger(__name__)
 
 
+class _GuardrailProviderReference:
+    """Runtime provider lookup that does not serialize the parent agent."""
+
+    def __init__(self, agent: Any) -> None:
+        self._agent_ref = None
+        self._fallback_provider = None
+        self.bind(agent)
+
+    def bind(self, agent: Any) -> None:
+        import weakref
+
+        self._fallback_provider = getattr(agent, "guardrail_provider", None)
+        try:
+            self._agent_ref = weakref.ref(agent)
+        except TypeError:
+            self._agent_ref = None
+
+    def __call__(self) -> Any:
+        agent = self._agent_ref() if self._agent_ref is not None else None
+        if agent is None:
+            return self._fallback_provider
+        self._fallback_provider = getattr(agent, "guardrail_provider", None)
+        return self._fallback_provider
+
+    def __getstate__(self) -> Dict[str, Any]:
+        return {"_fallback_provider": self()}
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self._agent_ref = None
+        self._fallback_provider = state.get("_fallback_provider")
+
+
 # Persistent background event loop for sync wrappers — asyncio.run() closes
 # the loop each call, which invalidates cached httpx.AsyncClient connections
 # in the OpenAI SDK. Keep one loop alive for the process lifetime.
@@ -95,6 +127,7 @@ if TYPE_CHECKING:
     from upsonic.integrations.promptlayer import PromptLayer
     from upsonic.agent.otel_manager import AgentOTelManager
     from fastmcp import FastMCP
+    from upsonic.guardrails import GuardrailProvider
 else:
     Model = "Model"
     ModelRequest = "ModelRequest"
@@ -118,6 +151,7 @@ else:
     InstrumentationSettings = "InstrumentationSettings"
     TracingProvider = "TracingProvider"
     RunData = "RunData"
+    GuardrailProvider = "GuardrailProvider"
 
 
 PromptCompressor = None
@@ -268,6 +302,7 @@ class Agent(BaseAgent):
         agent_policy: Optional[Union["Policy", List["Policy"]]] = None,
         tool_policy_pre: Optional[Union["Policy", List["Policy"]]] = None,
         tool_policy_post: Optional[Union["Policy", List["Policy"]]] = None,
+        guardrail_provider: Optional["GuardrailProvider"] = None,
         # Policy feedback loop settings
         user_policy_feedback: bool = False,
         agent_policy_feedback: bool = False,
@@ -359,6 +394,8 @@ class Agent(BaseAgent):
             reasoning_format: Reasoning format for Groq models ("hidden", "raw", "parsed")
             tool_policy_pre: Tool safety policy for pre-execution validation (single policy or list of policies)
             tool_policy_post: Tool safety policy for post-execution validation (single policy or list of policies)
+            guardrail_provider: Optional pre-tool-call authorization provider. Unlike SafetyEngine policies,
+                this decides whether the agent is authorized to call a tool at all. Provider errors fail closed.
             user_policy_feedback: Enable feedback loop for user policy violations (returns helpful message instead of blocking)
             agent_policy_feedback: Enable feedback loop for agent policy violations (re-executes agent with feedback)
             user_policy_feedback_loop: Maximum retry count for user policy feedback (default 1)
@@ -539,6 +576,7 @@ class Agent(BaseAgent):
         # Keep references
         self.tool_policy_pre = tool_policy_pre
         self.tool_policy_post = tool_policy_post
+        self.guardrail_provider = guardrail_provider
         
         # Handle reflection configuration
         if reflection and not reflection_config:
@@ -577,8 +615,7 @@ class Agent(BaseAgent):
         
         # Tool tracking (deprecated - now tracked in AgentRunOutput)
         # Kept for backwards compatibility
-        self._tool_call_count = 0
-        self._tool_limit_reached = False
+        self._reset_tool_execution_counters()
         
         
         # Run cancellation tracking
@@ -1873,6 +1910,7 @@ class Agent(BaseAgent):
         
         # Register only regular tools with ToolManager
         if regular_tools:
+            regular_tools = self._inherit_guardrail_provider_for_agent_tools(regular_tools)
             self.registered_agent_tools = self.tool_manager.register_tools(
                 tools=regular_tools,
                 task=None,  # Agent tools not task-specific
@@ -1942,6 +1980,7 @@ class Agent(BaseAgent):
         
         # Handle regular tools through ToolManager
         if regular_tools:
+            regular_tools = self._inherit_guardrail_provider_for_agent_tools(regular_tools)
             # Call ToolManager to register new tools (filters already registered ones)
             newly_registered = self.tool_manager.register_tools(
                 tools=regular_tools,
@@ -2032,6 +2071,154 @@ class Agent(BaseAgent):
             List[ToolDefinition]: List of tool definitions from the ToolManager
         """
         return self.tool_manager.get_tool_definitions()
+
+    def _reset_tool_execution_counters(self) -> None:
+        self._tool_call_count = 0
+        self._guardrail_denied_tool_call_count = 0
+        self._non_executed_tool_attempt_count = 0
+        self._tool_limit_reached = False
+
+    def _rebind_guardrail_provider_references(self, task: Optional["Task"] = None) -> None:
+        """Point restored child-agent wrappers at this parent for the current run."""
+        managers = [getattr(self, "tool_manager", None)]
+        if task is not None:
+            managers.append(getattr(task, "tool_manager", None))
+
+        for manager in managers:
+            registry = getattr(manager, "registry", None)
+            registered_tools = getattr(registry, "registered_tools", None) or {}
+            for tool in registered_tools.values():
+                bind_parent = getattr(tool, "bind_guardrail_provider_parent", None)
+                if callable(bind_parent):
+                    bind_parent(self)
+            orchestrator_lifecycle = getattr(manager, "orchestrator_lifecycle", None)
+            get_orchestrator = getattr(orchestrator_lifecycle, "get_orchestrator", None)
+            orchestrator = get_orchestrator() if callable(get_orchestrator) else None
+            bind_parent = getattr(orchestrator, "bind_guardrail_provider_parent", None)
+            if callable(bind_parent):
+                bind_parent(self)
+
+    def _inherit_guardrail_provider_for_agent_tools(self, tools: List[Any]) -> List[Any]:
+        provider_ref = _GuardrailProviderReference(self)
+
+        return [
+            self._agent_tool_with_inherited_guardrail_provider(
+                tool,
+                provider_ref,
+                dynamic_provider=True,
+            )
+            for tool in tools
+        ]
+
+    @classmethod
+    def _agent_tool_with_inherited_guardrail_provider(
+        cls,
+        tool: Any,
+        provider: Any,
+        *,
+        dynamic_provider: bool = False,
+    ) -> Any:
+        provider_value = provider() if dynamic_provider else provider
+
+        from upsonic.tools.wrappers import AgentTool
+
+        if isinstance(tool, AgentTool):
+            child_provider = getattr(tool.agent, "guardrail_provider", None)
+            if (
+                child_provider is not None
+                or getattr(tool, "_guardrail_provider_getter", None) is not None
+                or tool.guardrail_provider is not None
+            ):
+                return tool
+            if dynamic_provider:
+                inherited_tool = copy.copy(tool)
+                inherited_tool._guardrail_provider = None
+                inherited_tool._guardrail_provider_getter = provider
+                inherited_tool._guardrail_provider_inherited = True
+                return inherited_tool
+            if provider_value is None:
+                return tool
+            inherited_tool = AgentTool(tool.agent, guardrail_provider=provider_value)
+            inherited_tool._guardrail_provider_inherited = True
+            return inherited_tool
+
+        if not cls._is_agent_like_tool(tool):
+            return tool
+
+        current_provider = getattr(tool, "guardrail_provider", None)
+        if current_provider is not None:
+            return tool
+
+        if dynamic_provider:
+            inherited_tool = AgentTool(tool, guardrail_provider_getter=provider)
+            inherited_tool._guardrail_provider_inherited = True
+            return inherited_tool
+        if provider_value is None:
+            return tool
+        inherited_tool = AgentTool(tool, guardrail_provider=provider_value)
+        inherited_tool._guardrail_provider_inherited = True
+        return inherited_tool
+
+    @staticmethod
+    def _is_agent_like_tool(tool: Any) -> bool:
+        return (
+            tool is not None
+            and hasattr(tool, "name")
+            and (hasattr(tool, "do_async") or hasattr(tool, "do"))
+        )
+
+    @staticmethod
+    def _merged_execution_interval_duration(intervals: List[tuple[float, float]]) -> float:
+        if not intervals:
+            return 0.0
+
+        sorted_intervals = sorted(intervals)
+        merged_duration = 0.0
+        current_start, current_end = sorted_intervals[0]
+
+        for start, end in sorted_intervals[1:]:
+            if start <= current_end:
+                current_end = max(current_end, end)
+                continue
+            merged_duration += current_end - current_start
+            current_start, current_end = start, end
+
+        return merged_duration + current_end - current_start
+
+    def _record_guardrail_denial(self, output: Optional["AgentRunOutput"] = None) -> None:
+        self._guardrail_denied_tool_call_count = (
+            getattr(self, "_guardrail_denied_tool_call_count", 0) + 1
+        )
+        output = output or getattr(self, "_agent_run_output", None)
+        if output is not None:
+            output.guardrail_denied_tool_call_count = self._guardrail_denied_tool_call_count
+        self._sync_tool_attempt_limit(output)
+
+    def _record_non_executed_tool_attempt(self, output: Optional["AgentRunOutput"] = None) -> None:
+        self._non_executed_tool_attempt_count = (
+            getattr(self, "_non_executed_tool_attempt_count", 0) + 1
+        )
+        output = output or getattr(self, "_agent_run_output", None)
+        if output is not None:
+            output.non_executed_tool_attempt_count = self._non_executed_tool_attempt_count
+        self._sync_tool_attempt_limit(output)
+
+    def _tool_attempt_count(self) -> int:
+        return (
+            getattr(self, "_tool_call_count", 0)
+            + getattr(self, "_guardrail_denied_tool_call_count", 0)
+            + getattr(self, "_non_executed_tool_attempt_count", 0)
+        )
+
+    def _sync_tool_attempt_limit(self, output: Optional["AgentRunOutput"] = None) -> None:
+        attempted_tool_calls = (
+            self._tool_attempt_count()
+        )
+        tool_call_limit = getattr(self, "tool_call_limit", None)
+        if tool_call_limit and attempted_tool_calls >= tool_call_limit:
+            self._tool_limit_reached = True
+            if output is not None:
+                output.tool_limit_reached = True
     
     def _setup_task_tools(self, task: "Task") -> None:
         """Setup tools with a dedicated ToolManager on the task (task tools only)."""
@@ -2091,10 +2278,12 @@ class Agent(BaseAgent):
         task.task_builtin_tools = builtin_tools
         
         if regular_tools:
+            regular_tools = self._inherit_guardrail_provider_for_agent_tools(regular_tools)
             newly_registered = task_tool_manager.register_tools(
                 tools=regular_tools,
                 task=task,
-                agent_instance=agent_for_this_run
+                agent_instance=agent_for_this_run,
+                live_agent_instance=self,
             )
         else:
             newly_registered = {}
@@ -2208,7 +2397,7 @@ class Agent(BaseAgent):
         
         if hasattr(self, '_tool_limit_reached') and self._tool_limit_reached:
             tool_definitions = []
-        elif self.tool_call_limit and self._tool_call_count >= self.tool_call_limit:
+        elif self.tool_call_limit and self._tool_attempt_count() >= self.tool_call_limit:
             tool_definitions = []
             self._tool_limit_reached = True
         else:
@@ -2227,6 +2416,8 @@ class Agent(BaseAgent):
         for tool in task_builtin_tools:
             builtin_tools_dict[tool.unique_id] = tool
         builtin_tools = list(builtin_tools_dict.values())
+
+        self._reject_unauthorizable_provider_tools(builtin_tools)
         
         output_mode = 'text'
         output_object = None
@@ -2257,6 +2448,34 @@ class Agent(BaseAgent):
             output_tools=output_tools,
             allow_text_output=allow_text_output
         )
+
+    def _reject_unauthorizable_provider_tools(self, builtin_tools: list) -> None:
+        if getattr(self, "guardrail_provider", None) is None:
+            return
+
+        unsupported_sources: list[str] = [
+            getattr(tool, "unique_id", type(tool).__name__)
+            for tool in builtin_tools
+        ]
+        model_settings = getattr(getattr(self, "model", None), "settings", {}) or {}
+        if isinstance(model_settings, dict):
+            if model_settings.get("openai_builtin_tools"):
+                unsupported_sources.append("model.settings.openai_builtin_tools")
+            extra_body = model_settings.get("extra_body")
+            if isinstance(extra_body, dict):
+                for key in ("tools", "mcp_servers"):
+                    if extra_body.get(key):
+                        unsupported_sources.append(f"model.settings.extra_body.{key}")
+        model_profile = getattr(getattr(self, "model", None), "profile", None)
+        if getattr(model_profile, "groq_always_has_web_search_builtin_tool", False):
+            unsupported_sources.append("model.profile.groq_always_has_web_search_builtin_tool")
+
+        if unsupported_sources:
+            tool_names = ", ".join(unsupported_sources)
+            raise ValueError(
+                "guardrail_provider cannot authorize provider-native builtin tools before execution. "
+                f"Remove builtin tools or disable guardrail_provider. Unsupported builtin tools: {tool_names}"
+            )
     
     def _build_output_tools(self, response_format: type, schema: dict) -> list:
         """Build output tools for tool-based structured output.
@@ -2307,6 +2526,309 @@ class Agent(BaseAgent):
             tool_call_id=tool_call.tool_call_id,
             timestamp=now_utc(),
         )
+
+    async def _authorize_tool_call(
+        self,
+        tool_call: "ToolCallPart",
+        tool_def: Optional["ToolDefinition"],
+        arguments: Optional[Dict[str, Any]] = None,
+    ) -> "ToolReturnPart | None":
+        """Evaluate the optional pre-tool-call authorization provider."""
+        provider = getattr(self, "guardrail_provider", None)
+        if provider is None:
+            return None
+
+        from upsonic.guardrails import GuardrailRequest, aevaluate_guardrail
+        from upsonic.messages import ToolReturnPart
+
+        current_task = getattr(self, "current_task", None)
+        request = GuardrailRequest(
+            tool_name=tool_call.tool_name,
+            arguments=arguments if arguments is not None else tool_call.args_as_dict(),
+            tool_call_id=tool_call.tool_call_id,
+            tool_description=tool_def.description if tool_def else "",
+            tool_parameters=tool_def.parameters_json_schema if tool_def else {},
+            agent_name=getattr(self, "name", None),
+            agent_id=getattr(self, "agent_id_", None),
+            task_description=getattr(current_task, "description", None),
+            metadata=getattr(self, "metadata", {}) or {},
+        )
+        decision = await aevaluate_guardrail(provider, request)
+        if decision.allow:
+            return None
+        self._record_guardrail_denial()
+
+        return ToolReturnPart(
+            tool_name=tool_call.tool_name,
+            content=f"Tool blocked by guardrail provider: {decision.message()}",
+            tool_call_id=tool_call.tool_call_id,
+            timestamp=now_utc(),
+        )
+
+    def _external_execution_guardrail_part(
+        self,
+        tool_name: str,
+        tool_call_id: Optional[str],
+        manager: "ToolManager",
+    ) -> "ToolReturnPart | None":
+        if getattr(self, "guardrail_provider", None) is None:
+            return None
+        tool_obj = manager.registry.registered_tools.get(tool_name)
+        config = getattr(tool_obj, "config", None)
+        if not getattr(config, "external_execution", False):
+            return None
+
+        from upsonic.messages import ToolReturnPart
+
+        self._record_guardrail_denial()
+        return ToolReturnPart(
+            tool_name=tool_name,
+            content=(
+                "Tool blocked by guardrail provider: external_execution tools "
+                "cannot be authorized at the moment of execution."
+            ),
+            tool_call_id=tool_call_id,
+            timestamp=now_utc(),
+        )
+
+    def _get_tool_definition_from_manager(
+        self,
+        manager: "ToolManager",
+        tool_name: str,
+    ) -> Optional["ToolDefinition"]:
+        return next(
+            (definition for definition in manager.get_tool_definitions() if definition.name == tool_name),
+            None,
+        )
+
+    def _resolve_tool_definition(self, tool_name: str) -> Optional["ToolDefinition"]:
+        try:
+            manager = self._resolve_tool_manager(tool_name)
+        except ValueError:
+            return None
+        return self._get_tool_definition_from_manager(manager, tool_name)
+
+    def _prepare_tool_execution(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+    ) -> tuple["ToolManager", Optional["ToolDefinition"]]:
+        manager = self._resolve_tool_manager(tool_name)
+        tool_def = self._get_tool_definition_from_manager(manager, tool_name)
+        return manager, tool_def
+
+    def _guardrail_authorization_arguments(
+        self,
+        manager: "ToolManager",
+        tool_name: str,
+        args: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if getattr(self, "guardrail_provider", None) is None:
+            return args
+        expanded_args = self._expand_tool_arguments(manager, tool_name, args)
+        try:
+            return copy.deepcopy(expanded_args)
+        except Exception:
+            return dict(expanded_args)
+
+    def _expand_tool_arguments(
+        self,
+        manager: "ToolManager",
+        tool_name: str,
+        args: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Mirror callable defaults so providers authorize what will execute."""
+        effective_args = dict(args)
+        tool_obj = manager.registry.registered_tools.get(tool_name)
+        callable_obj = getattr(tool_obj, "function", None) or getattr(tool_obj, "execute", None)
+        if callable_obj is None:
+            return effective_args
+
+        import inspect
+        from typing import get_type_hints
+
+        try:
+            signature = inspect.signature(callable_obj)
+        except (TypeError, ValueError):
+            signature = None
+
+        if signature is not None:
+            for name, parameter in signature.parameters.items():
+                if name in effective_args or name == "self":
+                    continue
+                if parameter.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                ):
+                    continue
+                if parameter.default is not inspect.Parameter.empty:
+                    effective_args[name] = self._guardrail_safe_default(parameter.default)
+
+        try:
+            type_hints = get_type_hints(callable_obj)
+        except Exception:
+            type_hints = {}
+
+        for name, value in list(effective_args.items()):
+            annotation = type_hints.get(name)
+            if annotation is not None:
+                effective_args[name] = self._guardrail_safe_pydantic_value(annotation, value)
+
+        return effective_args
+
+    @staticmethod
+    def _guardrail_safe_default(value: Any) -> Any:
+        try:
+            from pydantic import BaseModel
+
+            if isinstance(value, BaseModel):
+                return Agent._guardrail_model_dump_for_authorization(value)
+        except Exception:
+            pass
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+
+    @staticmethod
+    def _guardrail_safe_pydantic_value(annotation: Any, value: Any) -> Any:
+        try:
+            from pydantic import BaseModel
+            from types import UnionType
+            from typing import Union as TypingUnion
+            from typing import get_args, get_origin
+
+            def is_model_type(type_hint: Any) -> bool:
+                try:
+                    return isinstance(type_hint, type) and issubclass(type_hint, BaseModel)
+                except TypeError:
+                    return False
+
+            def normalize(type_hint: Any, raw_value: Any) -> Any:
+                if is_model_type(type_hint):
+                    if isinstance(raw_value, BaseModel):
+                        return Agent._guardrail_model_dump_for_authorization(raw_value)
+                    if isinstance(raw_value, dict):
+                        return Agent._guardrail_model_dump_for_authorization(type_hint.model_validate(raw_value))
+                    return raw_value
+
+                origin = get_origin(type_hint)
+                args = get_args(type_hint)
+                if origin is list and args and isinstance(raw_value, list):
+                    return [normalize(args[0], item) for item in raw_value]
+
+                if origin in (TypingUnion, UnionType):
+                    if raw_value is None:
+                        return None
+                    for arg in args:
+                        if arg is type(None):
+                            continue
+                        try:
+                            normalized = normalize(arg, raw_value)
+                        except Exception:
+                            continue
+                        if normalized is not raw_value:
+                            return normalized
+                    return raw_value
+
+                return raw_value
+
+            return normalize(annotation, value)
+        except Exception:
+            return value
+
+    @staticmethod
+    def _guardrail_model_dump_for_authorization(model: Any) -> Any:
+        """Dump Pydantic values using validation aliases, matching tool input schemas."""
+        try:
+            from pydantic import BaseModel, TypeAdapter
+
+            def validation_path(field_name: str, field: Any) -> tuple[Any, ...]:
+                def path_for(alias: Any) -> tuple[Any, ...] | None:
+                    if isinstance(alias, str):
+                        return (alias,)
+                    path = getattr(alias, "path", None)
+                    if path:
+                        return tuple(path)
+                    return None
+
+                validation_alias = getattr(field, "validation_alias", None)
+                choices = getattr(validation_alias, "choices", None)
+                if choices:
+                    for choice in choices:
+                        path = path_for(choice)
+                        if path:
+                            return path
+                path = path_for(validation_alias)
+                if path:
+                    return path
+                alias = getattr(field, "alias", None)
+                return (alias,) if isinstance(alias, str) else (field_name,)
+
+            def assign_path(target: dict[str, Any], path: tuple[Any, ...], value: Any) -> bool:
+                if not path or isinstance(path[0], int):
+                    return False
+                current: Any = target
+                for index, segment in enumerate(path[:-1]):
+                    next_segment = path[index + 1]
+                    if isinstance(segment, int):
+                        if not isinstance(current, list) or segment < 0:
+                            return False
+                        while len(current) <= segment:
+                            current.append(None)
+                        if current[segment] is None:
+                            current[segment] = [] if isinstance(next_segment, int) else {}
+                        current = current[segment]
+                        continue
+                    if not isinstance(current, dict):
+                        return False
+                    child = current.get(segment)
+                    expected_type = list if isinstance(next_segment, int) else dict
+                    if not isinstance(child, expected_type):
+                        child = [] if isinstance(next_segment, int) else {}
+                        current[segment] = child
+                    current = child
+
+                last = path[-1]
+                if isinstance(last, int):
+                    if not isinstance(current, list) or last < 0:
+                        return False
+                    while len(current) <= last:
+                        current.append(None)
+                    current[last] = value
+                    return True
+                if not isinstance(current, dict):
+                    return False
+                current[last] = value
+                return True
+
+            def dump_value(value: Any) -> Any:
+                if isinstance(value, BaseModel):
+                    return Agent._guardrail_model_dump_for_authorization(value)
+                if isinstance(value, list):
+                    return [dump_value(item) for item in value]
+                if isinstance(value, tuple):
+                    return [dump_value(item) for item in value]
+                if isinstance(value, dict):
+                    return {key: dump_value(item) for key, item in value.items()}
+                try:
+                    return TypeAdapter(type(value)).dump_python(value, mode="json")
+                except Exception:
+                    return value
+
+            fields = getattr(model.__class__, "model_fields", {})
+            dumped: dict[str, Any] = {}
+            for field_name, field in fields.items():
+                value = dump_value(getattr(model, field_name))
+                path = validation_path(field_name, field)
+                if not assign_path(dumped, path, value):
+                    dumped[field_name] = value
+            extra = getattr(model, "model_extra", None) or {}
+            dumped.update({key: dump_value(value) for key, value in extra.items()})
+            return dumped
+        except Exception:
+            return model.model_dump(mode="json", by_alias=True)
     
     async def _execute_tool_calls(self, tool_calls: List["ToolCallPart"]) -> List["ToolReturnPart"]:
         """
@@ -2325,7 +2847,8 @@ class Agent(BaseAgent):
         if self.run_id:
             raise_if_cancelled(self.run_id)
         
-        if self.tool_call_limit and self._tool_call_count >= self.tool_call_limit:
+        attempted_tool_calls = self._tool_attempt_count()
+        if self.tool_call_limit and attempted_tool_calls >= self.tool_call_limit:
             error_results = []
             for tool_call in tool_calls:
                 error_results.append(ToolReturnPart(
@@ -2355,7 +2878,7 @@ class Agent(BaseAgent):
         parallel_calls = []
         
         for tool_call in tool_calls:
-            tool_def = tool_defs.get(tool_call.tool_name)
+            tool_def = self._resolve_tool_definition(tool_call.tool_name) or tool_defs.get(tool_call.tool_name)
             if tool_def and tool_def.sequential:
                 sequential_calls.append(tool_call)
             else:
@@ -2364,18 +2887,32 @@ class Agent(BaseAgent):
         results = []
         
         for tool_call in sequential_calls:
+            if self.tool_call_limit and self._tool_attempt_count() >= self.tool_call_limit:
+                self._tool_limit_reached = True
+                results.append(ToolReturnPart(
+                    tool_name=tool_call.tool_name,
+                    content=f"Tool call limit of {self.tool_call_limit} reached. Cannot execute more tools.",
+                    tool_call_id=tool_call.tool_call_id
+                ))
+                continue
+
             output_part = self._handle_output_tool_call(tool_call, response_format, use_output_tool)
             if output_part is not None:
                 results.append(output_part)
                 continue
             # POST-EXECUTION TOOL CALL VALIDATION
+            tool_def = self._resolve_tool_definition(tool_call.tool_name) or tool_defs.get(tool_call.tool_name)
+            tool_args = tool_call.args_as_dict()
+            try:
+                _, tool_def = self._prepare_tool_execution(tool_call.tool_name, tool_args)
+            except ValueError:
+                pass
             if hasattr(self, 'tool_policy_post_manager') and self.tool_policy_post_manager.has_policies():
-                tool_def = tool_defs.get(tool_call.tool_name)
                 tool_call_info = {
                     "name": tool_call.tool_name,
                     "description": tool_def.description if tool_def else "",
                     "parameters": tool_def.parameters_json_schema if tool_def else {},
-                    "arguments": tool_call.args_as_dict(),
+                    "arguments": tool_args,
                     "call_id": tool_call.tool_call_id
                 }
                 
@@ -2402,21 +2939,47 @@ class Agent(BaseAgent):
                         tool_call_id=tool_call.tool_call_id,
                         timestamp=now_utc()
                     ))
+                    self._record_non_executed_tool_attempt()
                     continue  # Skip execution
             
             import time
-            tool_start_time = time.time()
             _tool_args = tool_call.args_as_dict()
+            tool_start_time = None
             with self._otel.tool_span(tool_call.tool_name, tool_call.tool_call_id, tool_args=_tool_args) as otel_tool_span:
                 try:
-                    target_manager = self._resolve_tool_manager(tool_call.tool_name)
+                    target_manager, tool_def = self._prepare_tool_execution(
+                        tool_call.tool_name,
+                        _tool_args,
+                    )
+                    authorization_args = self._guardrail_authorization_arguments(
+                        target_manager,
+                        tool_call.tool_name,
+                        _tool_args,
+                    )
+                    external_guardrail_part = self._external_execution_guardrail_part(
+                        tool_call.tool_name,
+                        tool_call.tool_call_id,
+                        target_manager,
+                    )
+                    if external_guardrail_part is not None:
+                        results.append(external_guardrail_part)
+                        continue
+                    guardrail_part = await self._authorize_tool_call(tool_call, tool_def, authorization_args)
+                    if guardrail_part is not None:
+                        results.append(guardrail_part)
+                        continue
+                    tool_start_time = time.time()
                     result = await target_manager.execute_tool(
                         tool_name=tool_call.tool_name,
                         args=_tool_args,
                         metrics=self._tool_metrics,
                         tool_call_id=tool_call.tool_call_id
                     )
-                    tool_execution_time = time.time() - tool_start_time
+                    tool_execution_time = (
+                        result.execution_time
+                        if result.execution_time is not None
+                        else time.time() - tool_start_time
+                    )
 
                     if hasattr(self, '_agent_run_output') and self._agent_run_output:
                         self._agent_run_output.add_tool_execution_time(tool_execution_time)
@@ -2472,10 +3035,14 @@ class Agent(BaseAgent):
                 except (ExternalExecutionPause, ConfirmationPause, UserInputPause) as e:
                     raise e
                 except Exception as e:
-                    tool_execution_time = time.time() - tool_start_time
+                    tool_execution_time = (
+                        time.time() - tool_start_time
+                        if tool_start_time is not None
+                        else 0.0
+                    )
                     self._otel.set_tool_result(otel_tool_span, tool_execution_time, success=False, error=e)
 
-                    if hasattr(self, '_agent_run_output') and self._agent_run_output:
+                    if tool_start_time is not None and hasattr(self, '_agent_run_output') and self._agent_run_output:
                         self._agent_run_output.add_tool_execution_time(tool_execution_time)
 
                     error_return = ToolReturnPart(
@@ -2485,6 +3052,7 @@ class Agent(BaseAgent):
                         timestamp=now_utc()
                     )
                     results.append(error_return)
+                    self._record_non_executed_tool_attempt()
                     
                     if self.debug and self.debug_level >= 2:
                         from upsonic.utils.printing import debug_log_level2
@@ -2504,22 +3072,58 @@ class Agent(BaseAgent):
                         )
         
         if parallel_calls:
-            async def execute_single_tool(tool_call: "ToolCallPart") -> "ToolReturnPart":
-                """Execute a single tool call and return the result."""
+            successful_results_by_index: dict[int, "ToolReturnPart"] = {}
+            executable_parallel_items = []
+            limit_blocked_parallel_items = []
+            for index, tool_call in enumerate(parallel_calls):
                 output_part = self._handle_output_tool_call(tool_call, response_format, use_output_tool)
                 if output_part is not None:
-                    return output_part
+                    successful_results_by_index[index] = output_part
+                else:
+                    executable_parallel_items.append((index, tool_call))
+
+            if not executable_parallel_items:
+                results.extend(successful_results_by_index[index] for index in sorted(successful_results_by_index))
+                return results
+
+            if self.tool_call_limit:
+                remaining_tool_attempts = self.tool_call_limit - self._tool_attempt_count()
+                if remaining_tool_attempts <= 0:
+                    self._tool_limit_reached = True
+                    for index, tool_call in executable_parallel_items:
+                        successful_results_by_index[index] = ToolReturnPart(
+                            tool_name=tool_call.tool_name,
+                            content=f"Tool call limit of {self.tool_call_limit} reached. Cannot execute more tools.",
+                            tool_call_id=tool_call.tool_call_id
+                        )
+                    results.extend(
+                        successful_results_by_index[index]
+                        for index in sorted(successful_results_by_index)
+                    )
+                    return results
+                if len(executable_parallel_items) > remaining_tool_attempts:
+                    limit_blocked_parallel_items = executable_parallel_items[remaining_tool_attempts:]
+                    executable_parallel_items = executable_parallel_items[:remaining_tool_attempts]
+                    self._tool_limit_reached = True
+
+            async def execute_single_tool(tool_call: "ToolCallPart") -> tuple["ToolReturnPart", bool, bool, Optional[tuple[float, float]]]:
+                """Return result, execution flags, and actual tool interval when execution starts."""
                 # POST-EXECUTION TOOL CALL VALIDATION (for parallel execution)
+                tool_def = self._resolve_tool_definition(tool_call.tool_name) or tool_defs.get(tool_call.tool_name)
+                tool_args = tool_call.args_as_dict()
+                try:
+                    _, tool_def = self._prepare_tool_execution(tool_call.tool_name, tool_args)
+                except ValueError:
+                    pass
                 if hasattr(self, 'tool_policy_post_manager') and self.tool_policy_post_manager.has_policies():
-                    tool_def = tool_defs.get(tool_call.tool_name)
                     tool_call_info = {
                         "name": tool_call.tool_name,
                         "description": tool_def.description if tool_def else "",
                         "parameters": tool_def.parameters_json_schema if tool_def else {},
-                        "arguments": tool_call.args_as_dict(),
+                        "arguments": tool_args,
                         "call_id": tool_call.tool_call_id
                     }
-                    
+
                     validation_result = await self.tool_policy_post_manager.execute_tool_call_validation_async(
                         tool_call_info=tool_call_info,
                         check_type="Post-Execution Tool Call Validation"
@@ -2533,28 +3137,52 @@ class Agent(BaseAgent):
                         # If DisallowedOperation was raised by a RAISE action policy, re-raise it
                         if validation_result.disallowed_exception:
                             raise validation_result.disallowed_exception
-                        
+
                         # Otherwise it's a BLOCK action - return error message without raising
                         return ToolReturnPart(
                             tool_name=tool_call.tool_name,
                             content=validation_result.get_final_message(),
                             tool_call_id=tool_call.tool_call_id,
                             timestamp=now_utc()
-                        )
-                
+                        ), False, True, None
+
                 import time as _time
-                _tool_start = _time.time()
+                _tool_start = None
                 _tool_args2 = tool_call.args_as_dict()
                 with self._otel.tool_span(tool_call.tool_name, tool_call.tool_call_id, tool_args=_tool_args2) as otel_tool_span:
                     try:
-                        target_manager = self._resolve_tool_manager(tool_call.tool_name)
+                        target_manager, tool_def = self._prepare_tool_execution(
+                            tool_call.tool_name,
+                            _tool_args2,
+                        )
+                        authorization_args = self._guardrail_authorization_arguments(
+                            target_manager,
+                            tool_call.tool_name,
+                            _tool_args2,
+                        )
+                        external_guardrail_part = self._external_execution_guardrail_part(
+                            tool_call.tool_name,
+                            tool_call.tool_call_id,
+                            target_manager,
+                        )
+                        if external_guardrail_part is not None:
+                            return external_guardrail_part, False, False, None
+                        guardrail_part = await self._authorize_tool_call(tool_call, tool_def, authorization_args)
+                        if guardrail_part is not None:
+                            return guardrail_part, False, False, None
+                        _tool_start = _time.time()
                         result = await target_manager.execute_tool(
                             tool_name=tool_call.tool_name,
                             args=_tool_args2,
                             metrics=self._tool_metrics,
                             tool_call_id=tool_call.tool_call_id
                         )
-                        _tool_elapsed = _time.time() - _tool_start
+                        _tool_elapsed = (
+                            result.execution_time
+                            if result.execution_time is not None
+                            else _time.time() - _tool_start
+                        )
+                        _tool_interval = (_tool_start, _tool_start + _tool_elapsed)
 
                         if hasattr(self, '_agent_run_output') and self._agent_run_output:
                             from upsonic.run.tools.tools import ToolExecution
@@ -2569,44 +3197,44 @@ class Agent(BaseAgent):
                             self._agent_run_output.tools.append(tool_exec)
 
                         self._otel.set_tool_result(otel_tool_span, _tool_elapsed, success=True, output=result.content)
-                        
+
                         return ToolReturnPart(
                             tool_name=result.tool_name,
                             content=result.content,
                             tool_call_id=result.tool_call_id,
                             timestamp=now_utc()
-                        )
-                    
+                        ), True, False, _tool_interval
+
                     except (ExternalExecutionPause, ConfirmationPause, UserInputPause):
                         raise
                     except Exception as e:
-                        _tool_elapsed = _time.time() - _tool_start
+                        _tool_end = _time.time()
+                        _tool_elapsed = _tool_end - _tool_start if _tool_start is not None else 0.0
                         self._otel.set_tool_result(otel_tool_span, _tool_elapsed, success=False, error=e)
+                        _tool_interval = (_tool_start, _tool_end) if _tool_start is not None else None
                         return ToolReturnPart(
                             tool_name=tool_call.tool_name,
                             content=f"Error executing tool: {str(e)}",
                             tool_call_id=tool_call.tool_call_id,
                             timestamp=now_utc()
-                        )
-            
-            import time as _time_mod
-            _parallel_batch_start: float = _time_mod.time()
+                        ), False, True, _tool_interval
+
             parallel_results = await asyncio.gather(
-                *[execute_single_tool(tc) for tc in parallel_calls],
+                *[execute_single_tool(tc) for _, tc in executable_parallel_items],
                 return_exceptions=True
             )
-            _parallel_batch_elapsed: float = _time_mod.time() - _parallel_batch_start
-            if hasattr(self, '_agent_run_output') and self._agent_run_output:
-                self._agent_run_output.add_tool_execution_time(_parallel_batch_elapsed)
-            
+
             # Separate successful results from HITL pauses
             external_pauses: List[ExternalExecutionPause] = []
             confirmation_pauses: List[ConfirmationPause] = []
             user_input_pauses: List[UserInputPause] = []
-            successful_results: List["ToolReturnPart"] = []
+            executed_parallel_calls = 0
+            non_executed_parallel_attempts = 0
+            parallel_execution_intervals: List[tuple[float, float]] = []
+            parallel_accounting_committed = False
             other_errors: List[Exception] = []
-            
-            for tc, result in zip(parallel_calls, parallel_results):
+
+            for (index, tc), result in zip(executable_parallel_items, parallel_results):
                 if isinstance(result, ConfirmationPause):
                     confirmation_pauses.append(result)
                 elif isinstance(result, UserInputPause):
@@ -2615,15 +3243,66 @@ class Agent(BaseAgent):
                     external_pauses.append(result)
                 elif isinstance(result, Exception):
                     other_errors.append(result)
-                    successful_results.append(ToolReturnPart(
+                    non_executed_parallel_attempts += 1
+                    successful_results_by_index[index] = ToolReturnPart(
                         tool_name=tc.tool_name,
                         content=f"Error executing tool: {str(result)}",
                         tool_call_id=tc.tool_call_id,
                         timestamp=now_utc()
-                    ))
+                    )
                 else:
-                    successful_results.append(result)
-            
+                    tool_return, executed, non_executed_attempt, execution_interval = result
+                    successful_results_by_index[index] = tool_return
+                    if execution_interval is not None:
+                        parallel_execution_intervals.append(execution_interval)
+                    if executed:
+                        executed_parallel_calls += 1
+                    elif non_executed_attempt:
+                        non_executed_parallel_attempts += 1
+
+            for index, tool_call in limit_blocked_parallel_items:
+                successful_results_by_index[index] = ToolReturnPart(
+                    tool_name=tool_call.tool_name,
+                    content=f"Tool call limit of {self.tool_call_limit} reached. Cannot execute more tools.",
+                    tool_call_id=tool_call.tool_call_id
+                )
+
+            successful_results = [
+                successful_results_by_index[index]
+                for index in range(len(parallel_calls))
+                if index in successful_results_by_index
+            ]
+
+            def commit_parallel_accounting() -> None:
+                nonlocal parallel_accounting_committed
+                if parallel_accounting_committed:
+                    return
+                self._tool_call_count += executed_parallel_calls
+                for _ in range(non_executed_parallel_attempts):
+                    self._record_non_executed_tool_attempt()
+                if hasattr(self, '_tool_metrics') and self._tool_metrics:
+                    self._tool_metrics.tool_call_count = self._tool_call_count
+                if hasattr(self, '_agent_run_output') and self._agent_run_output is not None:
+                    if parallel_execution_intervals:
+                        self._agent_run_output.add_tool_execution_time(
+                            self._merged_execution_interval_duration(parallel_execution_intervals)
+                        )
+                    self._agent_run_output.tool_call_count = self._tool_call_count
+                    self._agent_run_output.increment_tool_calls(executed_parallel_calls)
+                parallel_accounting_committed = True
+
+            if confirmation_pauses or user_input_pauses or external_pauses:
+                commit_parallel_accounting()
+                if successful_results and hasattr(self, '_agent_run_output') and self._agent_run_output:
+                    from upsonic.messages import ModelRequest
+                    response = getattr(self._agent_run_output, "response", None)
+                    if response is not None and (
+                        not self._agent_run_output.chat_history
+                        or self._agent_run_output.chat_history[-1] != response
+                    ):
+                        self._agent_run_output.chat_history.append(response)
+                    self._agent_run_output.chat_history.append(ModelRequest(parts=successful_results))
+
             if confirmation_pauses:
                 all_calls = []
                 for pause in confirmation_pauses:
@@ -2647,14 +3326,9 @@ class Agent(BaseAgent):
                     if pause.paused_calls:
                         all_paused_calls.extend(pause.paused_calls)
                 raise ExternalExecutionPause(paused_calls=all_paused_calls)
-            
-            self._tool_call_count += len(parallel_calls)
-            if hasattr(self, '_tool_metrics') and self._tool_metrics:
-                self._tool_metrics.tool_call_count = self._tool_call_count
-            if hasattr(self, '_agent_run_output') and self._agent_run_output is not None:
-                self._agent_run_output.tool_call_count = self._tool_call_count
-                self._agent_run_output.increment_tool_calls(len(parallel_calls))
-            
+
+            commit_parallel_accounting()
+
             results.extend(successful_results)
         
         return results
@@ -3753,8 +4427,7 @@ class Agent(BaseAgent):
         # Only reset per-run agent state for fresh runs — HITL resume should
         # keep existing state so cost and tool counts aggregate correctly.
         if not is_resuming:
-            self._tool_call_count = 0
-            self._tool_limit_reached = False
+            self._reset_tool_execution_counters()
         self._last_built_system_prompt = None
 
         # Push agent + task scope onto the usage-registry contextvars so the
@@ -4402,8 +5075,7 @@ class Agent(BaseAgent):
             return
 
         # Reset per-run state (same as do_async for fresh runs)
-        self._tool_call_count = 0
-        self._tool_limit_reached = False
+        self._reset_tool_execution_counters()
         self._last_built_system_prompt = None
 
         # Push usage scope for the duration of the stream — symmetric with
@@ -4803,30 +5475,56 @@ class Agent(BaseAgent):
                 continue
 
             result_content: Optional[str] = None
+            record_execution = True
+            guarded_resume_without_provider = (
+                getattr(te, "requires_guardrail_authorization", False)
+                and getattr(self, "guardrail_provider", None) is None
+            )
+
+            tool_call_limit = getattr(self, "tool_call_limit", None)
+            if tool_call_limit and self._tool_attempt_count() >= tool_call_limit:
+                result_content = (
+                    f"Tool call limit of {tool_call_limit} reached. "
+                    "Cannot execute more tools."
+                )
+                record_execution = False
+                self._tool_limit_reached = True
+                output.tool_limit_reached = True
+            elif guarded_resume_without_provider:
+                result_content = (
+                    "Tool blocked by guardrail provider: guarded HITL continuation "
+                    "requires a guardrail provider to reauthorize before execution."
+                )
+                record_execution = False
+                self._record_guardrail_denial(output)
 
             # --- External execution: result already set by user ---
-            if te.external_execution_required and te.result is not None:
-                result_content = te.result
+            elif te.external_execution_required and te.result is not None:
+                if getattr(self, "guardrail_provider", None) is not None:
+                    result_content = (
+                        "Tool blocked by guardrail provider: external_execution results "
+                        "cannot be accepted without a fresh execution-time authorization."
+                    )
+                    record_execution = False
+                    self._record_guardrail_denial(output)
+                else:
+                    result_content = te.result
 
             # --- Confirmation ---
             elif te.requires_confirmation and requirement.confirmation is not None:
                 if requirement.confirmation:
-                    import time as _time
-                    _tool_start = _time.time()
-                    result_content = await self._execute_confirmed_tool(te)
-                    _tool_elapsed = _time.time() - _tool_start
-                    output.add_tool_execution_time(_tool_elapsed)
+                    result_content, record_execution, execution_time = await self._execute_confirmed_tool(te)
+                    if execution_time is not None:
+                        output.add_tool_execution_time(execution_time)
                 else:
                     note = requirement.confirmation_note or "Tool execution rejected by user."
                     result_content = f"Tool execution rejected: {note}"
 
             # --- User input ---
             elif te.requires_user_input and te.answered:
-                import time as _time
-                _tool_start = _time.time()
-                result_content = await self._execute_user_input_tool(te, requirement)
-                _tool_elapsed = _time.time() - _tool_start
-                output.add_tool_execution_time(_tool_elapsed)
+                result_content, record_execution, execution_time = await self._execute_user_input_tool(te, requirement)
+                if execution_time is not None:
+                    output.add_tool_execution_time(execution_time)
 
             if result_content is not None:
                 te.result = result_content
@@ -4837,9 +5535,10 @@ class Agent(BaseAgent):
                     tool_call_id=te.tool_call_id,
                     timestamp=now_utc(),
                 ))
-                output.tools.append(te)
-                self._tool_call_count += 1
-                output.increment_tool_calls(1)
+                if record_execution:
+                    output.tools.append(te)
+                    self._tool_call_count += 1
+                    output.increment_tool_calls(1)
 
         if tool_return_parts:
             output.chat_history.append(ModelRequest(parts=tool_return_parts))
@@ -4848,7 +5547,8 @@ class Agent(BaseAgent):
         self,
         tool_name: str,
         tool_args: Dict[str, Any],
-    ) -> str:
+        tool_call_id: Optional[str] = None,
+    ) -> tuple[str, bool, Optional[float]]:
         """Execute a tool bypassing HITL checks (for confirmed/user-input-answered tools).
         
         Calls the underlying function directly to avoid re-triggering pause exceptions.
@@ -4862,14 +5562,40 @@ class Agent(BaseAgent):
         )
 
         try:
-            manager = self._resolve_tool_manager(tool_name)
+            manager, tool_def = self._prepare_tool_execution(tool_name, tool_args)
         except ValueError:
-            return f"Error: Tool '{tool_name}' not found in any ToolManager"
+            self._record_non_executed_tool_attempt()
+            return f"Error: Tool '{tool_name}' not found in any ToolManager", False, None
 
         tool_obj = manager.registry.registered_tools.get(tool_name)
         if not tool_obj:
-            return f"Error: Tool '{tool_name}' not registered"
+            self._record_non_executed_tool_attempt()
+            return f"Error: Tool '{tool_name}' not registered", False, None
 
+        external_guardrail_part = self._external_execution_guardrail_part(
+            tool_name,
+            tool_call_id,
+            manager,
+        )
+        if external_guardrail_part is not None:
+            return str(external_guardrail_part.content), False, None
+
+        from upsonic.messages import ToolCallPart
+        authorization_args = self._guardrail_authorization_arguments(manager, tool_name, tool_args)
+        guardrail_part = await self._authorize_tool_call(
+            ToolCallPart(
+                tool_name=tool_name,
+                args=authorization_args,
+                tool_call_id=tool_call_id,
+            ),
+            tool_def,
+            authorization_args,
+        )
+        if guardrail_part is not None:
+            return str(guardrail_part.content), False, None
+
+        import time as _time
+        tool_start = _time.time()
         try:
             if hasattr(tool_obj, 'function'):
                 func = tool_obj.function
@@ -4880,7 +5606,7 @@ class Agent(BaseAgent):
                     result = await loop.run_in_executor(None, lambda: func(**tool_args))
             else:
                 result = await tool_obj.execute(**tool_args)
-            return str(result) if result is not None else ""
+            return str(result) if result is not None else "", True, _time.time() - tool_start
         except (
             _hitl_ExternalExecutionPause,
             _hitl_ConfirmationPause,
@@ -4889,22 +5615,23 @@ class Agent(BaseAgent):
         ):
             raise
         except Exception as exc:
-            return f"Error executing tool {tool_name}: {exc}"
+            self._record_non_executed_tool_attempt()
+            return f"Error executing tool {tool_name}: {exc}", False, _time.time() - tool_start
 
     async def _execute_confirmed_tool(
         self,
         te: "ToolExecution",
-    ) -> str:
+    ) -> tuple[str, bool, Optional[float]]:
         """Execute a tool that was confirmed by the user."""
         if not te.tool_name or te.tool_args is None:
-            return "Error: Missing tool name or arguments for confirmed tool"
-        return await self._execute_hitl_tool_directly(te.tool_name, te.tool_args)
+            return "Error: Missing tool name or arguments for confirmed tool", False, None
+        return await self._execute_hitl_tool_directly(te.tool_name, te.tool_args, te.tool_call_id)
 
     async def _execute_user_input_tool(
         self,
         te: "ToolExecution",
         requirement: "RunRequirement",
-    ) -> str:
+    ) -> tuple[str, bool, Optional[float]]:
         """Execute a tool after user has provided input values.
 
         For static user-input tools (``@tool(requires_user_input=True)``),
@@ -4917,7 +5644,7 @@ class Agent(BaseAgent):
         directly as the tool result so the agent can proceed.
         """
         if not te.tool_name:
-            return "Error: Missing tool name for user input tool"
+            return "Error: Missing tool name for user input tool", False, None
 
         merged_args: Dict[str, Any] = dict(te.tool_args or {})
         user_provided: Dict[str, str] = {}
@@ -4929,9 +5656,9 @@ class Agent(BaseAgent):
 
         from upsonic.tools.hitl import UserInputPause
         try:
-            return await self._execute_hitl_tool_directly(te.tool_name, merged_args)
+            return await self._execute_hitl_tool_directly(te.tool_name, merged_args, te.tool_call_id)
         except (UserInputPause, TypeError):
-            return self._format_user_input_result(user_provided)
+            return self._format_user_input_result(user_provided), True, 0.0
 
     @staticmethod
     def _format_user_input_result(user_provided: Dict[str, str]) -> str:
@@ -5181,6 +5908,8 @@ class Agent(BaseAgent):
         if task is None:
             raise ValueError("Cannot extract task from checkpoint")
 
+        self._rebind_guardrail_provider_references(task)
+
         # Rebind task._usage to output.usage so cross-process resume — where
         # both sides deserialize into separate TaskUsage instances — keeps
         # a single mutation target. AgentRunOutput is the canonical usage.
@@ -5211,6 +5940,22 @@ class Agent(BaseAgent):
             # so finalize_run_messages() captures every message — including
             # injected tool results — that belongs to this run.
             output.start_new_run()
+
+        # Restore counters before HITL injection so fresh reauthorization
+        # denials add to the persisted attempt total instead of replacing it.
+        self._tool_call_count = getattr(output, 'tool_call_count', 0)
+        self._guardrail_denied_tool_call_count = getattr(
+            output,
+            'guardrail_denied_tool_call_count',
+            0,
+        )
+        self._non_executed_tool_attempt_count = getattr(
+            output,
+            'non_executed_tool_attempt_count',
+            0,
+        )
+        self._tool_limit_reached = False
+        self._sync_tool_attempt_limit(output)
         
         # For paused runs, inject HITL results (external tool, confirmation, user input)
         if run_status == RunStatus.paused:
@@ -5233,11 +5978,6 @@ class Agent(BaseAgent):
         # Clear paused state and set up for continuation
         task.is_paused = False
         output.task = task
-
-        # Restore agent-level tool call count so tool_call_limit stays correct
-        # across HITL / cross-process resume (agent.__init__ zeroes it).
-        self._tool_call_count = getattr(output, 'tool_call_count', 0)
-        self._tool_limit_reached = False
 
         if task.enable_cache:
             task.set_cache_manager(self._cache_manager)

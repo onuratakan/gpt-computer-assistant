@@ -139,6 +139,9 @@ class PauseHandler:
         For ``UserInputPause`` it also sets ``exc.user_input_schema`` to
         the list of resolved ``UserInputField`` instances.
         """
+        if getattr(exc, "paused_calls", None):
+            return
+
         if isinstance(exc, ConfirmationPause):
             paused_call = PausedToolCall(
                 tool_name=tool_name,

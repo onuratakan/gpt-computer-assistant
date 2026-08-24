@@ -769,6 +769,7 @@ class PipelineManager:
         if not paused_calls:
             raise RuntimeError("ExternalExecutionPause must have paused_calls attached by ToolManager")
 
+        requires_guardrail_authorization = getattr(self.agent, "guardrail_provider", None) is not None
         for paused_call in paused_calls:
             tool_execution = ToolExecution(
                 tool_call_id=paused_call.tool_call_id,
@@ -776,6 +777,7 @@ class PipelineManager:
                 tool_args=paused_call.tool_args,
                 result=paused_call.result,
                 external_execution_required=True,
+                requires_guardrail_authorization=requires_guardrail_authorization,
             )
             
             requirement = RunRequirement(tool_execution=tool_execution)
@@ -811,12 +813,14 @@ class PipelineManager:
         if not paused_calls:
             raise RuntimeError("ConfirmationPause must have paused_calls attached by ToolManager")
 
+        requires_guardrail_authorization = getattr(self.agent, "guardrail_provider", None) is not None
         for paused_call in paused_calls:
             tool_execution = ToolExecution(
                 tool_call_id=paused_call.tool_call_id,
                 tool_name=paused_call.tool_name,
                 tool_args=paused_call.tool_args,
                 requires_confirmation=True,
+                requires_guardrail_authorization=requires_guardrail_authorization,
             )
             requirement = RunRequirement(tool_execution=tool_execution)
             output.add_requirement(requirement)
@@ -850,6 +854,7 @@ class PipelineManager:
         if not paused_calls:
             raise RuntimeError("UserInputPause must have paused_calls attached by ToolManager")
 
+        requires_guardrail_authorization = getattr(self.agent, "guardrail_provider", None) is not None
         for paused_call in paused_calls:
             tool_execution = ToolExecution(
                 tool_call_id=paused_call.tool_call_id,
@@ -857,6 +862,7 @@ class PipelineManager:
                 tool_args=paused_call.tool_args,
                 requires_user_input=True,
                 user_input_schema=paused_call.user_input_schema,
+                requires_guardrail_authorization=requires_guardrail_authorization,
             )
             requirement = RunRequirement(tool_execution=tool_execution)
             output.add_requirement(requirement)

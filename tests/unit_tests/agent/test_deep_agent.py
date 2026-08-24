@@ -12,8 +12,11 @@ import pytest
 
 from upsonic import Agent, Task
 from upsonic.agent.deepagent import DeepAgent, Todo
+from upsonic.agent.deepagent.tools.subagent_toolkit import SubagentToolKit
+from upsonic.guardrails import AllowlistProvider
 from upsonic.storage.in_memory import InMemoryStorage
 from upsonic.storage.memory.memory import Memory
+from upsonic.tools.wrappers import AgentTool
 
 
 class MockModel:
@@ -96,6 +99,80 @@ class TestDeepAgentInitialization(unittest.TestCase):
         agent = DeepAgent(model="openai/gpt-4o", tool_call_limit=50)
 
         self.assertEqual(agent.tool_call_limit, 50)
+
+    @patch("upsonic.models.infer_model")
+    def test_default_subagent_inherits_guardrail_provider(self, mock_infer_model):
+        """Default general-purpose subagent resolves current parent guardrails."""
+        mock_model = MockModel()
+        mock_infer_model.return_value = mock_model
+        provider = AllowlistProvider(allowed_tools=["task"])
+        replacement_provider = AllowlistProvider(allowed_tools=["write_file"])
+
+        agent = DeepAgent(model="openai/gpt-4o", guardrail_provider=provider)
+
+        general_purpose = next(
+            subagent for subagent in agent.subagents if subagent.name == "general-purpose"
+        )
+        agent.guardrail_provider = replacement_provider
+        bound_general_purpose = agent._subagent_toolkit._subagent_for_execution(general_purpose)
+
+        self.assertIs(general_purpose.guardrail_provider, None)
+        self.assertIs(bound_general_purpose.guardrail_provider, replacement_provider)
+
+    @patch("upsonic.models.infer_model")
+    def test_constructor_subagents_use_parent_guardrail_provider_per_invocation(self, mock_infer_model):
+        """Constructor subagents use parent guardrails without mutating shared agents."""
+        mock_model = MockModel()
+        mock_infer_model.return_value = mock_model
+        provider = AllowlistProvider(allowed_tools=["task"])
+        subagent = Agent(model=mock_model, name="researcher")
+
+        agent = DeepAgent(
+            model="openai/gpt-4o",
+            subagents=[subagent],
+            enable_subagents=True,
+            guardrail_provider=provider,
+        )
+
+        researcher = next(subagent for subagent in agent.subagents if subagent.name == "researcher")
+        bound_researcher = agent._subagent_toolkit._subagent_for_execution(researcher)
+        self.assertIs(researcher.guardrail_provider, None)
+        self.assertIs(bound_researcher.guardrail_provider, provider)
+
+    @patch("upsonic.models.infer_model")
+    def test_added_subagents_use_parent_guardrail_provider_per_invocation(self, mock_infer_model):
+        """Dynamically added subagents use parent guardrails without mutation."""
+        mock_model = MockModel()
+        mock_infer_model.return_value = mock_model
+        provider = AllowlistProvider(allowed_tools=["task"])
+        agent = DeepAgent(
+            model="openai/gpt-4o",
+            enable_subagents=False,
+            guardrail_provider=provider,
+        )
+        subagent = Agent(model=mock_model, name="reviewer")
+
+        agent.add_subagent(subagent)
+
+        toolkit = SubagentToolKit(parent_agent=agent)
+        bound_subagent = toolkit._subagent_for_execution(subagent)
+        self.assertIs(subagent.guardrail_provider, None)
+        self.assertIs(bound_subagent.guardrail_provider, provider)
+
+    @patch("upsonic.models.infer_model")
+    def test_guarded_deepagent_child_rebinds_toolkits_to_execution_clone(self, mock_infer_model):
+        """Delegated DeepAgent clones should not reuse toolkits bound to originals."""
+        mock_model = MockModel()
+        mock_infer_model.return_value = mock_model
+        provider = AllowlistProvider(allowed_tools=["task"])
+        child = DeepAgent(model="openai/gpt-4o", name="child", enable_subagents=True)
+
+        bound_child = AgentTool(child, guardrail_provider=provider)._agent_for_execution()
+
+        self.assertIsNot(bound_child, child)
+        self.assertIsNot(bound_child._subagent_toolkit, child._subagent_toolkit)
+        self.assertIs(bound_child._subagent_toolkit.agent, bound_child)
+        self.assertIs(child._subagent_toolkit.agent, child)
 
 
 class TestDeepAgentDoMethods(unittest.TestCase):

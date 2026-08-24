@@ -14,6 +14,34 @@ if TYPE_CHECKING:
     from upsonic.tools.registry import ToolRegistry
 
 
+class _AgentReference:
+    """Weak live-agent lookup with a serializable fallback agent."""
+
+    def __init__(self, agent: Any, fallback_agent: Any = None) -> None:
+        self._fallback_agent = fallback_agent if fallback_agent is not None else agent
+        self._agent_ref = None
+        self.bind(agent)
+
+    def bind(self, agent: Any) -> None:
+        import weakref
+
+        try:
+            self._agent_ref = weakref.ref(agent)
+        except TypeError:
+            self._agent_ref = None
+
+    def __call__(self) -> Any:
+        agent = self._agent_ref() if self._agent_ref is not None else None
+        return agent if agent is not None else self._fallback_agent
+
+    def __getstate__(self) -> Dict[str, Any]:
+        return {"_fallback_agent": self._fallback_agent}
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self._agent_ref = None
+        self._fallback_agent = state.get("_fallback_agent")
+
+
 class PlanStep(BaseModel):
     """Single tool call in a high-level plan."""
     tool_name: str = Field(
@@ -121,7 +149,8 @@ class Orchestrator(Tool):
         self,
         agent_instance: Any,
         task: Optional['Task'],
-        wrapped_tools: Dict[str, Callable]
+        wrapped_tools: Dict[str, Callable],
+        live_agent_instance: Any = None,
     ):
         """Initialize the orchestrator."""
         # Initialize Tool base class
@@ -132,6 +161,10 @@ class Orchestrator(Tool):
         )
         
         self.agent_instance = agent_instance
+        self._guardrail_agent_ref = _AgentReference(
+            live_agent_instance or agent_instance,
+            fallback_agent=agent_instance,
+        )
         self.task = task
         self.wrapped_tools = wrapped_tools
         self.is_reasoning_enabled = agent_instance.enable_reasoning_tool if agent_instance else False
@@ -147,6 +180,12 @@ class Orchestrator(Tool):
             for name, func in wrapped_tools.items()
             if name != 'plan_and_execute'
         }
+
+    def bind_guardrail_provider_parent(self, agent: Any) -> None:
+        self._guardrail_agent_ref.bind(agent)
+
+    def _guardrail_agent(self) -> Any:
+        return self._guardrail_agent_ref()
     
     async def execute(self, thought: Thought) -> Any:
         """Main entry point for orchestrator execution."""
@@ -193,8 +232,36 @@ class Orchestrator(Tool):
             console.print(f"[bold red]{result}[/bold red]")
         else:
             try:
-                tool_to_call = self.all_tools[tool_name]
-                result = await tool_to_call(**params)
+                guardrail_agent = self._guardrail_agent()
+                agent_attrs = getattr(guardrail_agent, "__dict__", {})
+                has_guardrail_provider = (
+                    isinstance(agent_attrs, dict)
+                    and "guardrail_provider" in agent_attrs
+                ) or hasattr(type(guardrail_agent), "guardrail_provider")
+                guardrail_provider = (
+                    getattr(guardrail_agent, "guardrail_provider", None)
+                    if has_guardrail_provider
+                    else None
+                )
+                if guardrail_provider is not None and hasattr(guardrail_agent, "_execute_tool_calls"):
+                    from upsonic.messages import ToolCallPart
+
+                    tool_limit = getattr(guardrail_agent, "tool_call_limit", None)
+                    attempt_count = getattr(guardrail_agent, "_tool_attempt_count", None)
+                    if tool_limit and callable(attempt_count) and attempt_count() + 1 >= tool_limit:
+                        guardrail_agent._tool_limit_reached = True
+                        run_output = getattr(guardrail_agent, "_agent_run_output", None)
+                        if run_output is not None:
+                            run_output.tool_limit_reached = True
+                        result = f"Tool call limit of {tool_limit} reached. Cannot execute more tools."
+                    else:
+                        tool_results = await guardrail_agent._execute_tool_calls([
+                            ToolCallPart(tool_name=tool_name, args=params)
+                        ])
+                        result = tool_results[0].content if tool_results else None
+                else:
+                    tool_to_call = self.all_tools[tool_name]
+                    result = await tool_to_call(**params)
             except Exception as e:
                 error_message = f"An error occurred while executing tool '{tool_name}': {e}"
                 console.print(f"[bold red]{error_message}[/bold red]")
@@ -380,6 +447,7 @@ class OrchestratorLifecycle:
         new_tools: Dict[str, Tool],
         task: Optional["Task"],
         agent_instance: Optional[Any],
+        live_agent_instance: Optional[Any] = None,
     ) -> None:
         """Handle ``plan_and_execute`` orchestrator creation/update.
 
@@ -396,6 +464,8 @@ class OrchestratorLifecycle:
         if 'plan_and_execute' in new_tools:
             if agent_instance and agent_instance.enable_thinking_tool:
                 if self._orchestrator:
+                    if live_agent_instance is not None:
+                        self._orchestrator.bind_guardrail_provider_parent(live_agent_instance)
                     self._orchestrator.wrapped_tools = wrapped_tools
                     self._orchestrator.all_tools = {
                         name: func
@@ -410,6 +480,7 @@ class OrchestratorLifecycle:
                         agent_instance=agent_instance,
                         task=task,
                         wrapped_tools=wrapped_tools,
+                        live_agent_instance=live_agent_instance,
                     )
 
                 orchestrator = self._orchestrator
