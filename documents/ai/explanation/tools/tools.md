@@ -522,6 +522,10 @@ wrapper:
 - On `execute(request, **kwargs)`, builds a `Task(description=request)` and
   calls `agent.do_async(task, return_output=True)` (or `agent.do(task)` in
   an executor as a fallback).
+- If a parent agent has a `guardrail_provider`, wrappers created for child
+  agents inherit it without mutating the child object. The inherited provider is
+  resolved when the child is invoked, so reused child agents follow the current
+  parent policy unless the child already defines its own provider.
 - Accumulates child-agent token usage in `_accumulated_usage` (a `RunUsage`
   instance) and exposes it via `drain_accumulated_usage()` so the parent
   agent's run-output can roll up sub-agent costs.

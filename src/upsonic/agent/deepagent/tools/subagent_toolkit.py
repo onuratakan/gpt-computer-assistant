@@ -117,7 +117,10 @@ class SubagentToolKit(ToolKit):
                 not_main_task=True  # Don't print summaries
             )
             
-            # Execute using the pre-configured subagent
+            # Execute using the pre-configured subagent. If the parent has a
+            # guardrail provider and the child does not, bind it to this
+            # invocation without mutating a potentially shared child agent.
+            selected_subagent = self._subagent_for_execution(selected_subagent)
             result = await selected_subagent.do_async(subtask)
             
             # Return simple output
@@ -126,6 +129,15 @@ class SubagentToolKit(ToolKit):
         except Exception as e:
             # Return error to LLM (don't raise)
             return f"❌ Subagent execution failed: {str(e)}"
+
+    def _subagent_for_execution(self, subagent: Any) -> Any:
+        provider = getattr(self.agent, "guardrail_provider", None)
+        if provider is None or getattr(subagent, "guardrail_provider", None) is not None:
+            return subagent
+
+        from upsonic.tools.wrappers import AgentTool
+
+        return AgentTool(subagent, guardrail_provider=provider)._agent_for_execution()
     
     def get_subagent_names(self) -> List[str]:
         """

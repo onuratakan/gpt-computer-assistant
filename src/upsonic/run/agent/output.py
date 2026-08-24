@@ -119,6 +119,7 @@ class AgentRunOutput:
     # --- Tool executions ---
     tools: Optional[List["ToolExecution"]] = None
     tool_call_count: int = 0
+    guardrail_denied_tool_call_count: int = 0
     tool_limit_reached: bool = False
     
     # --- Media outputs ---
@@ -166,6 +167,7 @@ class AgentRunOutput:
     # _run_boundaries tracks where each run starts in chat_history
     # This allows extracting new messages from just this run
     _run_boundaries: List[int] = field(default_factory=list)
+    non_executed_tool_attempt_count: int = 0
     
     # --- Timestamps ---
     created_at: int = field(default_factory=lambda: int(current_time()))
@@ -649,6 +651,8 @@ class AgentRunOutput:
             "model_provider": self.model_provider,
             "memory_message_count": self.memory_message_count,
             "tool_call_count": self.tool_call_count,
+            "guardrail_denied_tool_call_count": self.guardrail_denied_tool_call_count,
+            "non_executed_tool_attempt_count": self.non_executed_tool_attempt_count,
             "tool_limit_reached": self.tool_limit_reached,
             "metadata": self.metadata,
             "session_state": self.session_state,
@@ -1080,6 +1084,8 @@ class AgentRunOutput:
             memory_message_count=data.get("memory_message_count", 0),
             tools=tools,
             tool_call_count=data.get("tool_call_count", 0),
+            guardrail_denied_tool_call_count=data.get("guardrail_denied_tool_call_count", 0),
+            non_executed_tool_attempt_count=data.get("non_executed_tool_attempt_count", 0),
             tool_limit_reached=data.get("tool_limit_reached", False),
             images=images,
             files=files,

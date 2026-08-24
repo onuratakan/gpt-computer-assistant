@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from upsonic.models.instrumented import InstrumentationSettings
     from upsonic.integrations.tracing import TracingProvider
     from upsonic.integrations.promptlayer import PromptLayer
+    from upsonic.guardrails import GuardrailProvider
 
 
 RetryMode = Literal["raise", "return_false"]
@@ -141,6 +142,7 @@ class AutonomousAgent(Agent):
         agent_policy: Optional[Union["Policy", List["Policy"]]] = None,
         tool_policy_pre: Optional[Union["Policy", List["Policy"]]] = None,
         tool_policy_post: Optional[Union["Policy", List["Policy"]]] = None,
+        guardrail_provider: Optional["GuardrailProvider"] = None,
         user_policy_feedback: bool = False,
         agent_policy_feedback: bool = False,
         user_policy_feedback_loop: int = 1,
@@ -333,6 +335,7 @@ class AutonomousAgent(Agent):
             agent_policy=agent_policy,
             tool_policy_pre=tool_policy_pre,
             tool_policy_post=tool_policy_post,
+            guardrail_provider=guardrail_provider,
             user_policy_feedback=user_policy_feedback,
             agent_policy_feedback=agent_policy_feedback,
             user_policy_feedback_loop=user_policy_feedback_loop,

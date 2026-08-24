@@ -118,6 +118,51 @@ result = agent.print_do(task)
 
 ---
 
+## Authorize Tool Calls Before Execution
+
+Use a guardrail provider when you need to decide whether an agent is authorized
+to call a tool before the tool runs. This complements SafetyEngine content
+policies: SafetyEngine checks whether content is safe; a guardrail provider
+checks whether the action should happen.
+
+```python
+from upsonic import Agent
+from upsonic.guardrails import AllowlistProvider
+
+agent = Agent(
+    model="anthropic/claude-sonnet-4-5",
+    guardrail_provider=AllowlistProvider(allowed_tools=["sum_tool"]),
+)
+```
+
+Custom providers can connect to internal policy services or hosted OAP/APort
+verification without adding a required dependency to Upsonic. Because
+`GuardrailRequest` exposes both `tool_name` and `tool_input`, generic OAP-style
+providers can be passed directly:
+
+When a guardrail provider is active, Upsonic rejects provider-native builtin
+tools and external-execution tools because they do not run through Upsonic's
+local pre-execution tool runner.
+
+```python
+from aport_guardrails.providers import OAPGuardrailProvider
+
+agent = Agent(
+    model="anthropic/claude-sonnet-4-5",
+    guardrail_provider=OAPGuardrailProvider(
+        framework="upsonic",
+        config_path=".aport/config.yaml",
+    ),
+)
+```
+
+See `tests/doc_examples/agent/guardrails/aport_verify_provider_example.py` for
+a small direct APort Verify API provider, and
+`tests/doc_examples/agent/guardrails/guardrail_use_cases_example.py` for coding,
+fintech operations, document analysis, and research patterns.
+
+---
+
 ## OCR and Document Processing
 
 Upsonic provides a unified OCR interface with a layered pipeline: Layer 0 handles document preparation (PDF to image conversion, preprocessing), Layer 1 runs the OCR engine.

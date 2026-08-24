@@ -3272,8 +3272,16 @@ class StreamModelExecutionStep(Step):
             # _execute_tool_calls already records per-tool time via
             # self._agent_run_output.add_tool_execution_time() internally,
             # so we must NOT add the elapsed time again here.
+            executed_count_before = getattr(agent, "_tool_call_count", 0)
             tool_results = await agent._execute_tool_calls(tool_calls)
-            context.tool_call_count = getattr(context, 'tool_call_count', 0) + len(tool_calls)
+            executed_count_after = getattr(agent, "_tool_call_count", executed_count_before)
+            context.tool_call_count = executed_count_after
+            context.guardrail_denied_tool_call_count = getattr(
+                agent,
+                "_guardrail_denied_tool_call_count",
+                getattr(context, "guardrail_denied_tool_call_count", 0),
+            )
+            context.tool_limit_reached = getattr(agent, "_tool_limit_reached", False)
 
             if getattr(task, '_policy_scope_tool_outputs', False) and getattr(task, '_anonymization_map', None):
                 from upsonic.safety_engine.models import PolicyInput as _ToolPolicyInput
@@ -3344,10 +3352,60 @@ class StreamModelExecutionStep(Step):
                 # Emit separator only if this round produced visible text
                 if accumulated_text.strip():
                     yield TextDeltaEvent(run_id=run_id, content="\n\n")
-                accumulated_text = ""
-                # Continue streaming with limit notification
-                async for event in self._stream_with_tool_calls(context, task, agent, model, model_params, accumulated_text, first_token_time):
-                    yield event
+                final_model_params = agent._build_model_request_parameters(task)
+                final_model_params = model.customize_request_parameters(final_model_params)
+
+                limit_stream_deanonymizer = (
+                    _StreamDeanonymizer(task._anonymization_map)
+                    if getattr(task, '_anonymization_map', None)
+                    else None
+                )
+                limit_accumulated_text = ""
+                _limit_stream_start = time.time()
+                async with model.request_stream(
+                    messages=context.chat_history,
+                    model_settings=model.settings,
+                    model_request_parameters=final_model_params
+                ) as limit_stream:
+                    async for event in limit_stream:
+                        agent_event = convert_llm_event_to_agent_event(
+                            event,
+                            accumulated_text=limit_accumulated_text
+                        )
+
+                        if agent_event:
+                            if isinstance(agent_event, TextDeltaEvent):
+                                limit_accumulated_text += agent_event.content
+                                if first_token_time is None:
+                                    first_token_time = time.time()
+                                    context.set_usage_time_to_first_token()
+
+                                if limit_stream_deanonymizer:
+                                    deanon_delta = limit_stream_deanonymizer.process_token(agent_event.content)
+                                    if deanon_delta:
+                                        yield TextDeltaEvent(run_id=run_id, content=deanon_delta)
+                                else:
+                                    yield agent_event
+                            else:
+                                yield agent_event
+
+                if limit_stream_deanonymizer:
+                    remaining = limit_stream_deanonymizer.flush()
+                    if remaining:
+                        yield TextDeltaEvent(run_id=run_id, content=remaining)
+
+                _limit_stream_elapsed = time.time() - _limit_stream_start
+                context.add_model_execution_time(_limit_stream_elapsed)
+                limit_response = limit_stream.get()
+                context.response = limit_response
+                context.chat_history.append(limit_response)
+                record_response_usage(
+                    limit_response,
+                    model=model,
+                    pipeline_step="model_call_stream_tool_limit",
+                    model_execution_time=_limit_stream_elapsed,
+                    run_output=context,
+                )
                 return
             
             should_stop = False

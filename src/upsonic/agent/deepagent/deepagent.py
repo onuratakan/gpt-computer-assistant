@@ -202,7 +202,7 @@ class DeepAgent(Agent):
                     system_prompt=DEFAULT_SUBAGENT_PROMPT,
                     tools=general_purpose_tools,
                     memory=None,  # Complete isolation
-                    debug=self.debug
+                    debug=self.debug,
                 )
                 
                 # Add to subagents list
@@ -319,4 +319,3 @@ class DeepAgent(Agent):
         if hasattr(self.filesystem_backend, 'get_stats'):
             return self.filesystem_backend.get_stats()
         return {}
-

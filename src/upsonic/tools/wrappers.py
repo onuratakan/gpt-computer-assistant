@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
@@ -432,8 +433,16 @@ class FunctionTool(Tool):
 class AgentTool(Tool):
     """Wrapper for agent-based tools."""
     
-    def __init__(self, agent: Any):
+    def __init__(
+        self,
+        agent: Any,
+        guardrail_provider: Any = None,
+        guardrail_provider_getter: Optional[Callable[[], Any]] = None,
+    ):
         self.agent = agent
+        self._guardrail_provider = guardrail_provider
+        self._guardrail_provider_getter = guardrail_provider_getter
+        self._guardrail_provider_inherited = False
         
         # Generate tool name and description
         agent_name = getattr(agent, 'name', None) or f"Agent_{id(agent)}"
@@ -500,6 +509,34 @@ class AgentTool(Tool):
         name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
         name = re.sub(r'_+', '_', name)
         return name.lower().strip('_')
+
+    @property
+    def guardrail_provider(self) -> Any:
+        self._ensure_guardrail_provider_state()
+        if self._guardrail_provider_getter is not None:
+            return self._guardrail_provider_getter()
+        return self._guardrail_provider
+
+    @guardrail_provider.setter
+    def guardrail_provider(self, provider: Any) -> None:
+        self._guardrail_provider = provider
+        self._guardrail_provider_getter = None
+        self._guardrail_provider_inherited = False
+
+    def _ensure_guardrail_provider_state(self) -> None:
+        """Migrate AgentTool instances restored from older serialized state."""
+        if "_guardrail_provider_getter" not in self.__dict__:
+            self._guardrail_provider_getter = None
+        if "_guardrail_provider" not in self.__dict__:
+            self._guardrail_provider = self.__dict__.pop("guardrail_provider", None)
+        if "_guardrail_provider_inherited" not in self.__dict__:
+            self._guardrail_provider_inherited = self._guardrail_provider_getter is not None
+
+    def bind_guardrail_provider_parent(self, agent: Any) -> None:
+        self._ensure_guardrail_provider_state()
+        bind = getattr(self._guardrail_provider_getter, "bind", None)
+        if callable(bind):
+            bind(agent)
     
     async def execute(self, request: str, **kwargs: Any) -> Any:
         """Execute the agent with the given request."""
@@ -508,22 +545,77 @@ class AgentTool(Tool):
         
         # Create task for the agent
         task = Task(description=request)
+        agent = self._agent_for_execution()
         
         # Execute based on agent capabilities. Sub-agent spend is captured
         # directly into the usage registry via inherited scope contextvars,
         # so no manual accumulator is needed here.
-        if hasattr(self.agent, 'do_async'):
-            agent_output = await self.agent.do_async(task, return_output=True)
+        if hasattr(agent, 'do_async'):
+            agent_output = await agent.do_async(task, return_output=True)
             result = agent_output.output if hasattr(agent_output, 'output') else agent_output
-        elif hasattr(self.agent, 'do'):
+        elif hasattr(agent, 'do'):
             # Run sync method in executor
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
-                lambda: self.agent.do(task)
+                lambda: agent.do(task)
             )
         else:
-            raise AttributeError(f"Agent {self.agent} has no do or do_async method")
+            raise AttributeError(f"Agent {agent} has no do or do_async method")
         
         # Convert result to string if needed
         return str(result) if result is not None else "No response from agent"
+
+    def _agent_for_execution(self) -> Any:
+        """Bind inherited guardrails to this wrapper without mutating shared agents."""
+        self._ensure_guardrail_provider_state()
+        child_guardrail_provider = getattr(self.agent, "guardrail_provider", None)
+        guardrail_provider = (
+            child_guardrail_provider
+            if self._guardrail_provider_inherited and child_guardrail_provider is not None
+            else self.guardrail_provider
+        )
+        if guardrail_provider is None:
+            return self.agent
+
+        agent = copy.copy(self.agent)
+        agent.guardrail_provider = guardrail_provider
+        self._rebind_agent_owned_tools(agent)
+
+        if hasattr(agent, "_register_agent_tools"):
+            try:
+                from upsonic.tools import ToolManager
+
+                agent.tool_manager = ToolManager()
+                agent.registered_agent_tools = {}
+                agent.agent_builtin_tools = []
+                agent._register_agent_tools()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to prepare inherited guardrail provider for delegated agent"
+                ) from exc
+
+        return agent
+
+    def _rebind_agent_owned_tools(self, agent: Any) -> None:
+        """Point copied agent-aware toolkits at the execution clone."""
+        original_agent = self.agent
+        tools = getattr(agent, "tools", None)
+        if not tools:
+            return
+
+        replacements: Dict[int, Any] = {}
+        rebound_tools = []
+        for tool in tools:
+            rebound_tool = tool
+            if getattr(tool, "agent", None) is original_agent:
+                rebound_tool = copy.copy(tool)
+                rebound_tool.agent = agent
+                replacements[id(tool)] = rebound_tool
+            rebound_tools.append(rebound_tool)
+
+        agent.tools = rebound_tools
+        for name, value in list(getattr(agent, "__dict__", {}).items()):
+            replacement = replacements.get(id(value))
+            if replacement is not None:
+                setattr(agent, name, replacement)
